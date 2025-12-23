@@ -12,6 +12,15 @@
   "type": "module",
   "dependencies": {
     "express": "^5.2.1",
+    "multer": "^2.0.2",
     "uuid": "^13.0.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ngenda1/msimbistudio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Ngenda1/msimbistudio/issues"
+  },
+  "homepage": "https://github.com/Ngenda1/msimbistudio#readme"
 }
