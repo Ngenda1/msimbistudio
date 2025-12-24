@@ -8,61 +8,46 @@ import cors from "cors";
 
 const app = express();
 
-/**
- * ✅ FIXED CORS CONFIG
- * Allows:
- * - msimbi.com (production)
- * - lovable.dev
- * - ALL lovableproject.com preview subdomains
- */
+// --- CORS configuration ---
+const allowedOrigins = [
+  "https://msimbi.com", // production
+  "https://id-preview--5eec7204-b4c9-4ca7-9bf5-b31dde9c31ef.lovable.app" // Lovable preview
+];
+
 app.use(cors({
-  origin: [
-    "https://msimbi.com",
-    "https://lovable.dev",
-    /\.lovableproject\.com$/ // critical for Lovable previews
-  ],
-  methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type"]
+  origin: (origin, callback) => {
+    // allow requests with no origin (like curl or Postman)
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  }
 }));
 
 app.use(express.json());
 
-// --------------------
-// Folder setup
-// --------------------
+// --- Folders ---
 const JOBS_DIR = "jobs";
 const UPLOADS_DIR = "uploads";
 
 if (!fs.existsSync(JOBS_DIR)) fs.mkdirSync(JOBS_DIR);
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR);
 
-// --------------------
-// Multer config
-// --------------------
+// --- Multer config ---
 const upload = multer({ dest: UPLOADS_DIR });
 
-// --------------------
-// Render endpoint
-// --------------------
+// --- Render endpoint ---
 app.post("/render", upload.array("files"), (req, res) => {
   try {
     const jobId = uuid();
     const jobDir = path.join(JOBS_DIR, jobId);
-
     fs.mkdirSync(jobDir, { recursive: true });
 
-    // Validate timeline
-    if (!req.body.timeline) {
-      return res.status(400).json({ error: "Timeline missing" });
-    }
+    // Save timeline JSON
+    const timeline = JSON.parse(req.body.timeline || "{}");
+    fs.writeFileSync(path.join(jobDir, "timeline.json"), JSON.stringify(timeline, null, 2));
 
-    const timeline = JSON.parse(req.body.timeline);
-    fs.writeFileSync(
-      path.join(jobDir, "timeline.json"),
-      JSON.stringify(timeline, null, 2)
-    );
-
-    // Validate uploaded files
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ error: "No files uploaded" });
     }
@@ -71,12 +56,10 @@ app.post("/render", upload.array("files"), (req, res) => {
     const inputVideo = req.files[0].path;
     const outputVideo = path.join(jobDir, "output.mp4");
 
-    // --------------------
     // FFmpeg command
-    // --------------------
     const ffmpegArgs = [
       "-i", inputVideo,
-      "-vf", "drawtext=text='Msimbi Export':x=(w-text_w)/2:y=h-80:fontsize=24:fontcolor=white",
+      "-vf", "drawtext=text='Msimbi Export':x=(w-text_w)/2:y=h-80",
       "-y",
       outputVideo
     ];
@@ -84,42 +67,32 @@ app.post("/render", upload.array("files"), (req, res) => {
     const ffmpeg = spawn("ffmpeg", ffmpegArgs);
 
     ffmpeg.stderr.on("data", data => {
-      console.log(`[FFmpeg ${jobId}] ${data.toString()}`);
+      console.log(`[FFmpeg ${jobId}] ${data}`);
     });
 
     ffmpeg.on("close", code => {
-      console.log(`Job ${jobId} finished with exit code ${code}`);
+      console.log(`Job ${jobId} finished with code ${code}`);
     });
 
-    // Respond immediately (async render)
-    res.json({
-      jobId,
-      status: "rendering",
-      downloadUrl: `/download/${jobId}`
-    });
+    res.json({ jobId, message: "Render started" });
 
   } catch (err) {
-    console.error("Render error:", err);
+    console.error(err);
     res.status(500).json({ error: "Render failed" });
   }
 });
 
-// --------------------
-// Download endpoint
-// --------------------
+// --- Download endpoint ---
 app.get("/download/:jobId", (req, res) => {
-  const filePath = path.join(JOBS_DIR, req.params.jobId, "output.mp4");
-
-  if (fs.existsSync(filePath)) {
-    res.download(filePath);
+  const file = path.join(JOBS_DIR, req.params.jobId, "output.mp4");
+  if (fs.existsSync(file)) {
+    res.download(file);
   } else {
-    res.status(404).json({ error: "File not ready yet" });
+    res.status(404).json({ error: "File not ready" });
   }
 });
 
-// --------------------
-// Start server
-// --------------------
+// --- Start server ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Render server running on port ${PORT}`);
