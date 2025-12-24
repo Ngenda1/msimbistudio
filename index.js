@@ -16,7 +16,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 
 /* -------------------------------------------------
-   ✅ FINAL CORS CONFIG (CRITICAL FIX)
+   ✅ FINAL CORS CONFIG (NODE 22 + RENDER SAFE)
 -------------------------------------------------- */
 const allowedOrigins = [
   "https://msimbi.com",
@@ -51,7 +51,7 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // VERY IMPORTANT
+app.options("/*", cors(corsOptions)); // ✅ FIXED (was "*", breaks Node 22)
 app.use(express.json({ limit: "50mb" }));
 
 /* -------------------------------------------------
@@ -102,8 +102,10 @@ app.post("/render", upload.array("files"), async (req, res) => {
     }
 
     // Temporary simple render (first video only)
-    // Timeline processing will be expanded safely after stability
-    const inputVideo = req.files.find(f => f.mimetype.startsWith("video/"));
+    const inputVideo = req.files.find(f =>
+      f.mimetype.startsWith("video/")
+    );
+
     if (!inputVideo) {
       return res.status(400).json({ error: "No video file found" });
     }
@@ -157,9 +159,11 @@ app.post("/render", upload.array("files"), async (req, res) => {
 -------------------------------------------------- */
 app.get("/download/:jobId", (req, res) => {
   const file = path.join(JOBS_DIR, req.params.jobId, "output.mp4");
+
   if (!fs.existsSync(file)) {
     return res.status(404).json({ error: "File not ready" });
   }
+
   res.download(file);
 });
 
@@ -170,4 +174,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🎬 Render server listening on port ${PORT}`);
 });
-
