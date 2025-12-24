@@ -1,88 +1,90 @@
 import express from 'express';
+import cors from 'cors';
+import bodyParser from 'body-parser';
 import fs from 'fs';
 import path from 'path';
-import { exec } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Ensure jobs storage folder exists
-const JOBS_DIR = path.join(process.cwd(), 'jobs');
-const JOBS_FILE = path.join(JOBS_DIR, 'jobs.json');
-if (!fs.existsSync(JOBS_DIR)) fs.mkdirSync(JOBS_DIR);
-if (!fs.existsSync(JOBS_FILE)) fs.writeFileSync(JOBS_FILE, JSON.stringify({}));
+// Enable CORS for Lovable frontend
+app.use(cors({
+  origin: 'https://5eec7204-b4c9-4ca7-9bf5-b31dde9c31ef.lovableproject.com', // Lovable origin
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
-// Utility to load and save jobs persistently
-const loadJobs = () => JSON.parse(fs.readFileSync(JOBS_FILE, 'utf-8'));
-const saveJobs = (jobs) => fs.writeFileSync(JOBS_FILE, JSON.stringify(jobs, null, 2));
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 
-// Middleware to parse JSON
-app.use(express.json());
+// Store jobs in memory for demo purposes (can use DB for production)
+const jobs = {};
 
-// Start a new export job
-app.post('/export', (req, res) => {
+// POST /render - receive timeline and start export
+app.post('/render', (req, res) => {
   const jobId = uuidv4();
-  const outputPath = path.join(JOBS_DIR, `${jobId}.mp4`);
+  const timeline = req.body.timeline;
 
-  // Load current jobs
-  const jobs = loadJobs();
-  jobs[jobId] = { status: 'rendering', outputPath, createdAt: Date.now() };
-  saveJobs(jobs);
+  if (!timeline) {
+    return res.status(400).json({ error: 'No timeline provided' });
+  }
 
-  // Example FFmpeg command; replace with your actual export logic
-  const ffmpegCmd = `ffmpeg -y -i input.mp4 ${outputPath}`;
-  const ffmpegProcess = exec(ffmpegCmd, (error) => {
-    const jobs = loadJobs();
-    if (error) {
-      console.error(`Job ${jobId} failed:`, error);
-      jobs[jobId].status = 'failed';
-    } else {
-      jobs[jobId].status = 'completed';
-    }
-    saveJobs(jobs);
-  });
+  jobs[jobId] = { status: 'rendering', timeline, output: null, createdAt: Date.now() };
+  console.log(`Started job ${jobId} with timeline`);
+
+  // Simulate export process (replace with actual FFmpeg logic)
+  const outputDir = path.join(process.cwd(), 'jobs', jobId);
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+  const outputFile = path.join(outputDir, 'output.mp4');
+
+  // Simulate async export
+  setTimeout(() => {
+    fs.writeFileSync(outputFile, 'FAKE_VIDEO_CONTENT'); // Replace with real video generation
+    jobs[jobId].status = 'completed';
+    jobs[jobId].output = outputFile;
+    console.log(`Job ${jobId} completed`);
+  }, 5000); // simulate 5 seconds export
 
   res.json({ jobId, status: 'rendering' });
 });
 
-// Check job status
+// GET /status/:jobId - check status of a job
 app.get('/status/:jobId', (req, res) => {
-  const jobs = loadJobs();
-  const job = jobs[req.params.jobId];
-  if (!job) return res.status(404).json({ error: 'Job not found' });
-  res.json({ status: job.status });
+  const { jobId } = req.params;
+  const job = jobs[jobId];
+
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+
+  res.json({ jobId, status: job.status });
 });
 
-// Download completed job
+// GET /download/:jobId - download the exported video
 app.get('/download/:jobId', (req, res) => {
-  const jobs = loadJobs();
-  const job = jobs[req.params.jobId];
-  if (!job) return res.status(404).json({ error: 'Job not found' });
+  const { jobId } = req.params;
+  const job = jobs[jobId];
+
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
 
   if (job.status !== 'completed') {
     return res.status(400).json({ error: 'Job not completed yet' });
   }
 
-  if (!fs.existsSync(job.outputPath)) {
-    return res.status(500).json({ error: 'Output file missing' });
-  }
-
-  res.download(job.outputPath, `${req.params.jobId}.mp4`);
+  res.download(job.output, 'export.mp4', (err) => {
+    if (err) console.error(`Error sending file for job ${jobId}:`, err);
+  });
 });
 
-// Cleanup old failed jobs periodically (optional)
-setInterval(() => {
-  const jobs = loadJobs();
-  for (const [id, job] of Object.entries(jobs)) {
-    if (job.status === 'failed' && Date.now() - job.createdAt > 3600 * 1000) {
-      if (fs.existsSync(job.outputPath)) fs.unlinkSync(job.outputPath);
-      delete jobs[id];
-    }
-  }
-  saveJobs(jobs);
-}, 60 * 60 * 1000); // every hour
+// Health check
+app.get('/', (req, res) => {
+  res.send('Render server is running');
+});
 
 app.listen(PORT, () => {
-  console.log(`Render server listening on port ${PORT}`);
+  console.log(`🎬 Render server listening on port ${PORT}`);
 });
+
