@@ -16,7 +16,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 
 /* -------------------------------------------------
-   ✅ FINAL CORS CONFIG (NODE 22 + RENDER SAFE)
+   ✅ FINAL CORS CONFIG (Node 22 SAFE)
 -------------------------------------------------- */
 const allowedOrigins = [
   "https://msimbi.com",
@@ -26,15 +26,12 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow non-browser requests (Render health checks, curl, etc.)
     if (!origin) return callback(null, true);
 
-    // Exact matches
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
 
-    // Lovable dynamic subdomains
     if (
       origin.endsWith(".lovable.app") ||
       origin.endsWith(".lovableproject.com")
@@ -43,15 +40,13 @@ const corsOptions = {
     }
 
     console.error("❌ Blocked by CORS:", origin);
-    return callback(new Error("Not allowed by CORS"), false);
+    return callback(new Error("Not allowed by CORS"));
   },
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type"],
-  credentials: false,
 };
 
 app.use(cors(corsOptions));
-app.options("/*", cors(corsOptions)); // ✅ FIXED (was "*", breaks Node 22)
 app.use(express.json({ limit: "50mb" }));
 
 /* -------------------------------------------------
@@ -64,15 +59,15 @@ if (!fs.existsSync(JOBS_DIR)) fs.mkdirSync(JOBS_DIR);
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR);
 
 /* -------------------------------------------------
-   Multer (file uploads)
+   Multer
 -------------------------------------------------- */
 const upload = multer({
   dest: UPLOADS_DIR,
-  limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2GB
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 },
 });
 
 /* -------------------------------------------------
-   Health check (Render)
+   Health check
 -------------------------------------------------- */
 app.get("/", (_, res) => {
   res.send("Msimbi Render Server is running");
@@ -101,7 +96,6 @@ app.post("/render", upload.array("files"), async (req, res) => {
       return res.status(400).json({ error: "No media files uploaded" });
     }
 
-    // Temporary simple render (first video only)
     const inputVideo = req.files.find(f =>
       f.mimetype.startsWith("video/")
     );
@@ -141,7 +135,6 @@ app.post("/render", upload.array("files"), async (req, res) => {
       }
     });
 
-    // Respond immediately (Lovable expects async export)
     res.json({
       jobId,
       status: "rendering",
@@ -159,16 +152,14 @@ app.post("/render", upload.array("files"), async (req, res) => {
 -------------------------------------------------- */
 app.get("/download/:jobId", (req, res) => {
   const file = path.join(JOBS_DIR, req.params.jobId, "output.mp4");
-
   if (!fs.existsSync(file)) {
     return res.status(404).json({ error: "File not ready" });
   }
-
   res.download(file);
 });
 
 /* -------------------------------------------------
-   Start server (Render controls PORT)
+   Start server
 -------------------------------------------------- */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
