@@ -8,25 +8,26 @@ import cors from "cors";
 
 const app = express();
 
-// Allow requests from msimbi.com and Lovable preview domains
+// Allow CORS from msimbi.com and Lovable preview domains
 app.use(cors({
   origin: [
+    "https://www.msimbi.com",
     "https://msimbi.com",
-    /\.lovableproject\.com$/,
-    /\.lovable\.app$/
+    "https://lovable.dev",
+    "https://*.lovableproject.com",
+    "https://*.lovable.app"
   ]
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 
 // Folders
 const JOBS_DIR = "jobs";
 const UPLOADS_DIR = "uploads";
-
 if (!fs.existsSync(JOBS_DIR)) fs.mkdirSync(JOBS_DIR);
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR);
 
-// Multer config for file uploads
+// Multer config
 const upload = multer({ dest: UPLOADS_DIR });
 
 // --- Render endpoint ---
@@ -36,80 +37,104 @@ app.post("/render", upload.array("files"), async (req, res) => {
       return res.status(400).json({ error: "No files uploaded" });
     }
 
-    const timeline = JSON.parse(req.body.timeline);
     const jobId = uuid();
     const jobDir = path.join(JOBS_DIR, jobId);
     fs.mkdirSync(jobDir, { recursive: true });
 
     // Save timeline JSON
-    fs.writeFileSync(
-      path.join(jobDir, "timeline.json"),
-      JSON.stringify(timeline, null, 2)
-    );
+    const timeline = JSON.parse(req.body.timeline);
+    fs.writeFileSync(path.join(jobDir, "timeline.json"), JSON.stringify(timeline, null, 2));
 
-    const outputVideo = path.join(jobDir, "output.mp4");
+    // Process each clip to a standard format (re-encode)
+    const clipFiles = [];
 
-    // Build FFmpeg input arguments for all clips in the timeline
-    const ffmpegInputs = [];
-    const filterComplexParts = [];
+    for (let i = 0; i < timeline.clips.length; i++) {
+      const clip = timeline.clips[i];
+      const inputFile = req.files.find(f => f.originalname === clip.fileName);
+      if (!inputFile) continue;
 
-    timeline.clips.forEach((clip, i) => {
-      const file = req.files.find(f => f.originalname === clip.fileName);
-      if (!file) return;
+      const clipOutput = path.join(jobDir, `clip_${i}.mp4`);
 
-      ffmpegInputs.push("-i", file.path);
-
-      // Prepare video filter chain per clip
-      const start = clip.startPosition || 0;
-      const duration = clip.effectiveDuration || 5; // default 5s
-      let filter = `[${i}:v]trim=start=${start}:duration=${duration},setpts=PTS-STARTPTS`;
-
-      // Add drawtext if provided
-      if (clip.text) {
-        filter += `,drawtext=text='${clip.text}':x=(w-text_w)/2:y=h-80:fontsize=24:fontcolor=white`;
+      // Video filters
+      const filters = [];
+      if (clip.filters) {
+        if (clip.filters.brightness !== undefined) filters.push(`eq=brightness=${clip.filters.brightness}`);
+        if (clip.filters.contrast !== undefined) filters.push(`eq=contrast=${clip.filters.contrast}`);
+        if (clip.filters.saturation !== undefined) filters.push(`eq=saturation=${clip.filters.saturation}`);
+        if (clip.filters.hue !== undefined) filters.push(`hue=h=${clip.filters.hue}`);
+        // Additional filters can be added here
       }
+      const vf = filters.length > 0 ? filters.join(",") : undefined;
 
-      filterComplexParts.push(filter + `[v${i}]`);
-    });
+      // Audio normalization
+      const af = "loudnorm=I=-16:TP=-1.5:LRA=11";
 
-    // Concatenate video streams if more than one
-    let filterComplex = "";
-    if (filterComplexParts.length > 1) {
-      filterComplex = filterComplexParts.join("; ") +
-        `; ${filterComplexParts.map((_, i) => `[v${i}]`).join("")}concat=n=${filterComplexParts.length}:v=1:a=0[outv]`;
-    } else {
-      filterComplex = filterComplexParts[0] + ";[v0]copy[outv]";
+      const ffmpegArgs = [
+        "-i", inputFile.path,
+        ...(vf ? ["-vf", vf] : []),
+        "-af", af,
+        "-ss", clip.startPosition || 0,
+        "-t", clip.effectiveDuration || undefined,
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-pix_fmt", "yuv420p",
+        "-r", timeline.fps || 30,
+        "-y",
+        clipOutput
+      ].filter(arg => arg !== undefined);
+
+      await new Promise((resolve, reject) => {
+        const ffmpeg = spawn("ffmpeg", ffmpegArgs);
+
+        ffmpeg.stderr.on("data", data => console.log(`[FFmpeg clip ${i}] ${data}`));
+        ffmpeg.on("close", code => {
+          if (code === 0) {
+            clipFiles.push(clipOutput);
+            resolve();
+          } else {
+            reject(new Error(`Clip ${i} failed with code ${code}`));
+          }
+        });
+      });
     }
 
-    // Prepare FFmpeg arguments
-    const ffmpegArgs = [
-      ...ffmpegInputs,
-      "-filter_complex", filterComplex,
-      "-map", "[outv]",
-      "-map", "0:a?", // optional audio from first file
-      "-c:v", "libx264",
-      "-c:a", "aac",
-      "-b:v", timeline.settings?.videoBitrate || "3000k",
-      "-b:a", timeline.settings?.audioBitrate || "128k",
-      "-r", timeline.settings?.fps || 30,
-      "-y",
-      outputVideo
-    ];
+    // Create FFmpeg concat filter string
+    const filterComplex = clipFiles.map((file, i) => `[${i}:v:0][${i}:a:0]`).join('') + `concat=n=${clipFiles.length}:v=1:a=1[outv][outa]`;
 
-    const ffmpeg = spawn("ffmpeg", ffmpegArgs);
+    const finalOutput = path.join(jobDir, "output.mp4");
 
-    ffmpeg.stderr.on("data", data => {
-      console.log(`[FFmpeg ${jobId}] ${data}`);
+    // Prepare FFmpeg inputs
+    const ffmpegInputArgs = [];
+    clipFiles.forEach(file => ffmpegInputArgs.push("-i", file));
+
+    // Run final concat with re-encode
+    await new Promise((resolve, reject) => {
+      const ffmpegArgs = [
+        ...ffmpegInputArgs,
+        "-filter_complex", filterComplex,
+        "-map", "[outv]",
+        "-map", "[outa]",
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-pix_fmt", "yuv420p",
+        "-r", timeline.fps || 30,
+        "-y",
+        finalOutput
+      ];
+
+      const ffmpeg = spawn("ffmpeg", ffmpegArgs);
+      ffmpeg.stderr.on("data", data => console.log(`[FFmpeg final] ${data}`));
+      ffmpeg.on("close", code => {
+        if (code === 0) resolve();
+        else reject(new Error(`Final export failed with code ${code}`));
+      });
     });
 
-    ffmpeg.on("close", code => {
-      console.log(`Job ${jobId} finished with code ${code}`);
-    });
+    res.json({ jobId, message: "Render completed successfully", downloadUrl: `/download/${jobId}` });
 
-    res.json({ jobId, message: "Render started" });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Render failed" });
+    res.status(500).json({ error: "Render failed", details: err.message });
   }
 });
 
@@ -124,8 +149,7 @@ app.get("/download/:jobId", (req, res) => {
 });
 
 // Start server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Render server running on port ${PORT}`);
-});
+const PORT = process.env.PORT || process.env.RENDER_INTERNAL_PORT || 10000;
+app.listen(PORT, () => console.log(`Render server running on port ${PORT}`));
+
 
