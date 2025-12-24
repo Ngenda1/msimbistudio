@@ -7,10 +7,8 @@ import { v4 as uuid } from "uuid";
 import cors from "cors";
 
 const app = express();
-
-// Allow Lovable frontend
 app.use(cors({ origin: "https://msimbi.com" }));
-app.use(express.json());
+app.use(express.json({ limit: "100mb" }));
 
 // Folders
 const JOBS_DIR = "jobs";
@@ -22,118 +20,96 @@ if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR);
 // Multer config
 const upload = multer({ dest: UPLOADS_DIR });
 
-// Helper: Run FFmpeg command
-function runFFmpeg(args, jobId) {
-  return new Promise((resolve, reject) => {
-    const ffmpeg = spawn("ffmpeg", args);
-
-    ffmpeg.stdout.on("data", (data) => console.log(`[FFmpeg ${jobId} stdout] ${data}`));
-    ffmpeg.stderr.on("data", (data) => console.log(`[FFmpeg ${jobId} stderr] ${data}`));
-
-    ffmpeg.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`FFmpeg exited with code ${code}`));
-    });
+// Map Lovable filters to FFmpeg
+function mapFiltersToFFmpeg(filters) {
+  const ffmpegFilters = [];
+  filters.forEach(f => {
+    switch (f.type) {
+      case "brightness": ffmpegFilters.push(`eq=brightness=${f.value}`); break;
+      case "contrast": ffmpegFilters.push(`eq=contrast=${f.value}`); break;
+      case "saturation": ffmpegFilters.push(`eq=saturation=${f.value}`); break;
+      case "hue": ffmpegFilters.push(`hue=h=${f.value}`); break;
+      case "blur": ffmpegFilters.push(`boxblur=${f.value}`); break;
+      case "sharpen": ffmpegFilters.push(`unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount=${f.value}`); break;
+      case "invert": ffmpegFilters.push("negate"); break;
+      case "grayscale": ffmpegFilters.push("hue=s=0"); break;
+      default: break;
+    }
   });
+  return ffmpegFilters.join(",");
 }
 
 // --- Render endpoint ---
-app.post("/render", upload.array("files"), async (req, res) => {
+app.post("/render", upload.array("files"), (req, res) => {
   try {
-    if (!req.files || req.files.length === 0) {
+    if (!req.files || req.files.length === 0)
       return res.status(400).json({ error: "No files uploaded" });
-    }
 
+    const timeline = JSON.parse(req.body.timeline);
     const jobId = uuid();
     const jobDir = path.join(JOBS_DIR, jobId);
     fs.mkdirSync(jobDir, { recursive: true });
 
-    // Save timeline JSON
-    const timeline = JSON.parse(req.body.timeline);
     fs.writeFileSync(path.join(jobDir, "timeline.json"), JSON.stringify(timeline, null, 2));
 
-    const inputFiles = {};
-    req.files.forEach(file => {
-      inputFiles[file.originalname] = file.path;
-    });
+    const inputs = [];
+    const filterParts = [];
+    const audioParts = [];
+    const videoMap = [];
+    const audioMap = [];
 
-    const inputArgs = [];
-    const filterComplexParts = [];
-    const videoLabels = [];
-    const audioLabels = [];
-
-    // Process each clip
     timeline.clips.forEach((clip, index) => {
-      const inputPath = inputFiles[clip.fileName];
-      if (!inputPath) throw new Error(`Clip file not uploaded: ${clip.fileName}`);
+      const fileObj = req.files.find(f => f.originalname === clip.fileName);
+      if (!fileObj) return;
 
-      inputArgs.push("-i", inputPath);
+      inputs.push("-i", fileObj.path);
 
-      const vLabel = `v${index}`;
-      const aLabel = `a${index}`;
+      // Video filter
+      let vf = mapFiltersToFFmpeg(clip.filters || []);
+      vf += `${vf ? "," : ""}scale=${timeline.settings.width}:${timeline.settings.height}:force_original_aspect_ratio=decrease,pad=${timeline.settings.width}:${timeline.settings.height}:(ow-iw)/2:(oh-ih)/2`;
 
-      // Video trim and speed
-      let videoFilter = `[${index}:v]trim=start=${clip.start || 0}:end=${clip.end || clip.duration},setpts=PTS-STARTPTS`;
-      if (clip.speed && clip.speed !== 1) videoFilter += `,setpts=${1/clip.speed}*PTS`;
+      filterParts.push(`[${index}:v]trim=start=${clip.startPosition}:duration=${clip.effectiveDuration},setpts=PTS-STARTPTS${vf ? "," + vf : ""}[v${index}]`);
+      audioParts.push(`[${index}:a]atrim=start=${clip.startPosition}:duration=${clip.effectiveDuration},asetpts=PTS-STARTPTS,volume=${clip.audioVolume || 1}[a${index}]`);
 
-      // Scale
-      if (clip.width && clip.height) videoFilter += `,scale=${clip.width}:${clip.height}`;
-
-      // Text overlays
-      if (clip.text) {
-        videoFilter += `,drawtext=text='${clip.text}':x=${clip.x || "(w-text_w)/2"}:y=${clip.y || "h-80"}:fontsize=${clip.fontSize || 24}:fontcolor=${clip.color || "white"}:enable='between(t,${clip.start || 0},${clip.end || clip.duration})'`;
-      }
-
-      // Image overlays (stickers)
-      if (clip.images && clip.images.length > 0) {
-        clip.images.forEach((img, imgIndex) => {
-          videoFilter += `,overlay=x=${img.x || 0}:y=${img.y || 0}:enable='between(t,${img.start || 0},${img.end || clip.end || clip.duration})'`;
-        });
-      }
-
-      filterComplexParts.push(`${videoFilter}[${vLabel}]`);
-
-      // Audio trim, speed, volume
-      let audioFilter = `[${index}:a]atrim=start=${clip.start || 0}:end=${clip.end || clip.duration},asetpts=PTS-STARTPTS`;
-      if (clip.speed && clip.speed !== 1) audioFilter += `,atempo=${clip.speed}`;
-      if (clip.volume !== undefined) audioFilter += `,volume=${clip.volume}`;
-      filterComplexParts.push(`${audioFilter}[${aLabel}]`);
-
-      videoLabels.push(vLabel);
-      audioLabels.push(aLabel);
+      videoMap.push(`[v${index}]`);
+      audioMap.push(`[a${index}]`);
     });
 
-    // Concatenate all videos
-    const concatVideos = videoLabels.map(l => `[${l}]`).join("");
-    const concatAudios = audioLabels.map(l => `[${l}]`).join("");
-
-    filterComplexParts.push(`${concatVideos}concat=n=${videoLabels.length}:v=1:a=0[vid]`);
-    filterComplexParts.push(`${concatAudios}concat=n=${audioLabels.length}:v=0:a=1[aud]`);
+    const filterComplex = [
+      ...filterParts,
+      ...audioParts,
+      `${videoMap.join("")}concat=n=${timeline.clips.length}:v=1:a=0[v]`,
+      `${audioMap.join("")}concat=n=${timeline.clips.length}:v=0:a=1[a]`
+    ].join("; ");
 
     const outputVideo = path.join(jobDir, "output.mp4");
 
     const ffmpegArgs = [
-      ...inputArgs,
-      "-filter_complex", filterComplexParts.join(";"),
-      "-map", "[vid]",
-      "-map", "[aud]",
+      ...inputs,
+      "-filter_complex", filterComplex,
+      "-map", "[v]",
+      "-map", "[a]",
       "-c:v", "libx264",
-      "-preset", "fast",
-      "-crf", "23",
+      "-preset", "veryfast",
+      "-tune", "film",
+      "-crf", "20",
+      "-threads", "0",
       "-c:a", "aac",
-      "-movflags", "+faststart",
+      "-b:a", timeline.settings.audioBitrate || "160k",
       "-y",
       outputVideo
     ];
 
-    await runFFmpeg(ffmpegArgs, jobId);
+    const ffmpeg = spawn("ffmpeg", ffmpegArgs);
 
-    console.log(`Render complete for job ${jobId}`);
-    res.json({ jobId, message: "Render complete, download when ready" });
+    ffmpeg.stderr.on("data", data => console.log(`[FFmpeg ${jobId}] ${data}`));
+    ffmpeg.on("close", code => console.log(`Job ${jobId} finished with code ${code}`));
+
+    res.json({ jobId, message: "Render started" });
 
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Render failed", details: err.message });
+    res.status(500).json({ error: "Render failed" });
   }
 });
 
@@ -149,6 +125,4 @@ app.get("/download/:jobId", (req, res) => {
 
 // Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Render server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Render server running on port ${PORT}`));
