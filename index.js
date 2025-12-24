@@ -12,10 +12,11 @@ import { fileURLToPath } from "url";
 -------------------------------------------------- */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
 const app = express();
 
 /* -------------------------------------------------
-   CORS CONFIG (Node 22 / Render SAFE)
+   CORS (Node 22 / Render safe)
 -------------------------------------------------- */
 const allowedOrigins = [
   "https://msimbi.com",
@@ -23,40 +24,30 @@ const allowedOrigins = [
   "https://lovable.dev",
 ];
 
-const corsOptions = {
-  origin: (origin, callback) => {
-    if (!origin) return callback(null, true);
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
 
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
+      if (
+        allowedOrigins.includes(origin) ||
+        origin.endsWith(".lovable.app") ||
+        origin.endsWith(".lovableproject.com")
+      ) {
+        return callback(null, true);
+      }
 
-    if (
-      origin.endsWith(".lovable.app") ||
-      origin.endsWith(".lovableproject.com")
-    ) {
-      return callback(null, true);
-    }
+      return callback(new Error("Not allowed by CORS"), false);
+    },
+    methods: ["GET", "POST"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
 
-    console.error("❌ CORS blocked:", origin);
-    return callback(null, false);
-  },
-  methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type"],
-};
-
-app.use(cors(corsOptions));
 app.use(express.json({ limit: "50mb" }));
 
 /* -------------------------------------------------
-   Direct OPTIONS handler (NO wildcard crash)
--------------------------------------------------- */
-app.options("/render", cors(corsOptions));
-app.options("/status/:jobId", cors(corsOptions));
-app.options("/download/:jobId", cors(corsOptions));
-
-/* -------------------------------------------------
-   Storage folders
+   Folders
 -------------------------------------------------- */
 const JOBS_DIR = path.join(__dirname, "jobs");
 const UPLOADS_DIR = path.join(__dirname, "uploads");
@@ -67,21 +58,21 @@ if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR);
 /* -------------------------------------------------
    Job store (in-memory)
 -------------------------------------------------- */
-const jobs = new Map();
+const jobs = {};
 
 /* -------------------------------------------------
-   Multer uploads
+   Multer
 -------------------------------------------------- */
 const upload = multer({
   dest: UPLOADS_DIR,
-  limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2GB
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 },
 });
 
 /* -------------------------------------------------
    Health check
 -------------------------------------------------- */
 app.get("/", (_, res) => {
-  res.send("🎬 Msimbi Render Server running");
+  res.send("Msimbi Render Server running");
 });
 
 /* -------------------------------------------------
@@ -93,32 +84,27 @@ app.post("/render", upload.array("files"), async (req, res) => {
     const jobDir = path.join(JOBS_DIR, jobId);
     fs.mkdirSync(jobDir, { recursive: true });
 
-    jobs.set(jobId, { status: "rendering", startedAt: Date.now() });
+    jobs[jobId] = { status: "rendering" };
 
-    if (!req.body.timeline) {
-      jobs.set(jobId, { status: "failed" });
-      return res.status(400).json({ error: "Missing timeline" });
+    if (!req.files || req.files.length === 0) {
+      jobs[jobId].status = "failed";
+      return res.status(400).json({ error: "No files uploaded" });
     }
 
-    const timeline = JSON.parse(req.body.timeline);
-    fs.writeFileSync(
-      path.join(jobDir, "timeline.json"),
-      JSON.stringify(timeline, null, 2)
+    const inputVideo = req.files.find(f =>
+      f.mimetype.startsWith("video/")
     );
 
-    const inputVideo = req.files.find(f => f.mimetype.startsWith("video/"));
     if (!inputVideo) {
-      jobs.set(jobId, { status: "failed" });
+      jobs[jobId].status = "failed";
       return res.status(400).json({ error: "No video file found" });
     }
 
     const outputVideo = path.join(jobDir, "output.mp4");
 
-    const ffmpegArgs = [
+    const ffmpeg = spawn("ffmpeg", [
       "-y",
       "-i", inputVideo.path,
-      "-map", "0:v:0",
-      "-map", "0:a?",
       "-c:v", "libx264",
       "-preset", "medium",
       "-crf", "18",
@@ -127,9 +113,7 @@ app.post("/render", upload.array("files"), async (req, res) => {
       "-c:a", "aac",
       "-b:a", "192k",
       outputVideo
-    ];
-
-    const ffmpeg = spawn("ffmpeg", ffmpegArgs);
+    ]);
 
     ffmpeg.stderr.on("data", data => {
       console.log(`[FFmpeg ${jobId}] ${data.toString()}`);
@@ -137,24 +121,17 @@ app.post("/render", upload.array("files"), async (req, res) => {
 
     ffmpeg.on("close", code => {
       if (code === 0) {
-        jobs.set(jobId, {
-          status: "completed",
-          completedAt: Date.now(),
-        });
-        console.log(`✅ Render completed: ${jobId}`);
+        jobs[jobId].status = "completed";
+        console.log(`✅ Job ${jobId} completed`);
       } else {
-        jobs.set(jobId, {
-          status: "failed",
-          completedAt: Date.now(),
-        });
-        console.error(`❌ Render failed: ${jobId}`);
+        jobs[jobId].status = "failed";
+        console.error(`❌ Job ${jobId} failed`);
       }
     });
 
-    // Respond immediately (async workflow)
     res.json({
       jobId,
-      status: "rendering",
+      status: "rendering"
     });
 
   } catch (err) {
@@ -167,25 +144,39 @@ app.post("/render", upload.array("files"), async (req, res) => {
    Job status endpoint
 -------------------------------------------------- */
 app.get("/status/:jobId", (req, res) => {
-  const job = jobs.get(req.params.jobId);
+  const job = jobs[req.params.jobId];
 
   if (!job) {
-    return res.status(404).json({ status: "not_found" });
+    return res.status(404).json({ error: "Job not found" });
   }
 
-  res.json(job);
+  res.json({
+    status: job.status,
+    downloadReady: job.status === "completed",
+    downloadUrl:
+      job.status === "completed"
+        ? `/download/${req.params.jobId}`
+        : null
+  });
 });
 
 /* -------------------------------------------------
-   Download endpoint (ONLY after completed)
+   Download (LOCKED until completed)
 -------------------------------------------------- */
 app.get("/download/:jobId", (req, res) => {
-  const job = jobs.get(req.params.jobId);
-  const file = path.join(JOBS_DIR, req.params.jobId, "output.mp4");
+  const job = jobs[req.params.jobId];
 
-  if (!job || job.status !== "completed") {
-    return res.status(409).json({ error: "Render not completed" });
+  if (!job) {
+    return res.status(404).json({ error: "Job not found" });
   }
+
+  if (job.status !== "completed") {
+    return res.status(409).json({
+      error: "Export not completed yet"
+    });
+  }
+
+  const file = path.join(JOBS_DIR, req.params.jobId, "output.mp4");
 
   if (!fs.existsSync(file)) {
     return res.status(404).json({ error: "File missing" });
@@ -195,9 +186,9 @@ app.get("/download/:jobId", (req, res) => {
 });
 
 /* -------------------------------------------------
-   Start server (Render controls PORT)
+   Start server
 -------------------------------------------------- */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Render server listening on port ${PORT}`);
+  console.log(`🎬 Render server listening on port ${PORT}`);
 });
