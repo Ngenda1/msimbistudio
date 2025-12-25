@@ -15,7 +15,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 
 /* -------------------------------------------------
-   CORS — Lovable + Msimbi (CRITICAL)
+   CORS — Lovable + Msimbi
 -------------------------------------------------- */
 app.use(
   cors({
@@ -66,11 +66,11 @@ function runFFmpeg(args, jobId) {
   return new Promise((resolve, reject) => {
     const ff = spawn("ffmpeg", args);
 
-    ff.stderr.on("data", d => {
+    ff.stderr.on("data", (d) => {
       console.log(`[FFmpeg ${jobId}] ${d.toString()}`);
     });
 
-    ff.on("close", code => {
+    ff.on("close", (code) => {
       if (code === 0) resolve();
       else reject(new Error(`FFmpeg exited ${code}`));
     });
@@ -90,19 +90,14 @@ app.get("/", (_, res) => {
 app.post("/render", async (req, res) => {
   try {
     const timeline = req.body.timeline;
-    if (!timeline) {
-      return res.status(400).json({ error: "Missing timeline" });
-    }
+    if (!timeline) return res.status(400).json({ error: "Missing timeline" });
 
     const jobId = uuid();
     const jobDir = path.join(JOBS_DIR, jobId);
     const assetsDir = path.join(jobDir, "assets");
 
     fs.mkdirSync(assetsDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(jobDir, "timeline.json"),
-      JSON.stringify(timeline, null, 2)
-    );
+    fs.writeFileSync(path.join(jobDir, "timeline.json"), JSON.stringify(timeline, null, 2));
 
     jobs.set(jobId, { status: "rendering" });
 
@@ -119,7 +114,6 @@ app.post("/render", async (req, res) => {
     -------------------------------- */
     (async () => {
       try {
-        /* 1️⃣ Download media */
         const inputs = [];
 
         for (let i = 0; i < timeline.media.length; i++) {
@@ -133,42 +127,27 @@ app.post("/render", async (req, res) => {
           inputs.push({ ...media, path: localPath });
         }
 
-        if (inputs.length === 0) {
-          throw new Error("No media to render");
-        }
+        if (inputs.length === 0) throw new Error("No media to render");
 
-        /* 2️⃣ Build FFmpeg command (safe baseline) */
         const output = path.join(jobDir, "output.mp4");
 
         const ffmpegArgs = [
           "-y",
-          "-i",
-          inputs[0].path,
-          "-c:v",
-          "libx264",
-          "-preset",
-          "medium",
-          "-crf",
-          "18",
-          "-pix_fmt",
-          "yuv420p",
-          "-movflags",
-          "+faststart",
-          "-c:a",
-          "aac",
-          "-b:a",
-          "192k",
+          "-i", inputs[0].path,
+          "-c:v", "libx264",
+          "-preset", "medium",
+          "-crf", "18",
+          "-pix_fmt", "yuv420p",
+          "-movflags", "+faststart",
+          "-c:a", "aac",
+          "-b:a", "192k",
           output,
         ];
 
-        /* 3️⃣ Render */
         await runFFmpeg(ffmpegArgs, jobId);
 
-        /* 4️⃣ Validate output */
         const stats = fs.statSync(output);
-        if (stats.size < 100_000) {
-          throw new Error("Output video too small");
-        }
+        if (stats.size < 100_000) throw new Error("Output video too small");
 
         jobs.set(jobId, { status: "completed" });
         console.log(`✅ Render complete: ${jobId}`);
@@ -197,9 +176,7 @@ app.get("/status/:jobId", (req, res) => {
 -------------------------------------------------- */
 app.get("/download/:jobId", (req, res) => {
   const file = path.join(JOBS_DIR, req.params.jobId, "output.mp4");
-  if (!fs.existsSync(file)) {
-    return res.status(404).json({ error: "Not ready" });
-  }
+  if (!fs.existsSync(file)) return res.status(404).json({ error: "Not ready" });
   res.download(file);
 });
 
@@ -210,6 +187,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🎬 Render server running on port ${PORT}`);
 });
+
 
 
 
