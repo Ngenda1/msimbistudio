@@ -22,18 +22,17 @@ app.use(
     origin: (origin, cb) => {
       if (!origin) return cb(null, true);
 
-      if (
+      const allowed =
         origin === "https://msimbi.com" ||
         origin === "https://www.msimbi.com" ||
         origin === "https://lovable.dev" ||
         origin.endsWith(".lovable.app") ||
-        origin.endsWith(".lovableproject.com")
-      ) {
-        return cb(null, true);
-      }
+        origin.endsWith(".lovableproject.com");
+
+      if (allowed) return cb(null, true);
 
       console.error("❌ CORS blocked:", origin);
-      cb(null, false);
+      return cb(new Error("CORS blocked"), false);
     },
     methods: ["GET", "POST"],
   })
@@ -47,32 +46,50 @@ app.use(express.json({ limit: "50mb" }));
 const JOBS_DIR = path.join(__dirname, "jobs");
 fs.mkdirSync(JOBS_DIR, { recursive: true });
 
-const jobs = new Map(); // jobId → { status }
+/**
+ * jobId → {
+ *   status: queued | rendering | completed | failed
+ *   error?: string
+ * }
+ */
+const jobs = new Map();
 
 /* -------------------------------------------------
    Helpers
 -------------------------------------------------- */
 async function downloadFile(url, outputPath) {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed download: ${url}`);
+
+  if (!res.ok) {
+    throw new Error(`Failed to download asset: ${url}`);
+  }
 
   const buffer = Buffer.from(await res.arrayBuffer());
-  if (buffer.length === 0) throw new Error("Downloaded file is empty");
+
+  if (!buffer.length) {
+    throw new Error(`Downloaded asset is empty: ${url}`);
+  }
 
   fs.writeFileSync(outputPath, buffer);
 }
 
 function runFFmpeg(args, jobId) {
   return new Promise((resolve, reject) => {
-    const ff = spawn("ffmpeg", args);
+    const ff = spawn("ffmpeg", args, {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
 
-    ff.stderr.on("data", (d) => {
-      console.log(`[FFmpeg ${jobId}] ${d.toString()}`);
+    ff.stderr.on("data", (data) => {
+      console.log(`[FFmpeg ${jobId}] ${data.toString().trim()}`);
+    });
+
+    ff.on("error", (err) => {
+      reject(err);
     });
 
     ff.on("close", (code) => {
       if (code === 0) resolve();
-      else reject(new Error(`FFmpeg exited ${code}`));
+      else reject(new Error(`FFmpeg exited with code ${code}`));
     });
   });
 }
@@ -88,78 +105,102 @@ app.get("/", (_, res) => {
    Render Endpoint
 -------------------------------------------------- */
 app.post("/render", async (req, res) => {
-  try {
-    const timeline = req.body.timeline;
-    if (!timeline) return res.status(400).json({ error: "Missing timeline" });
+  const timeline = req.body?.timeline;
 
-    const jobId = uuid();
-    const jobDir = path.join(JOBS_DIR, jobId);
-    const assetsDir = path.join(jobDir, "assets");
+  /* ---- Validation (Lovable compatibility) ---- */
+  if (!timeline || !Array.isArray(timeline.media)) {
+    return res.status(400).json({
+      error: "Invalid timeline format. Expected { timeline: { media: [] } }",
+    });
+  }
 
-    fs.mkdirSync(assetsDir, { recursive: true });
-    fs.writeFileSync(path.join(jobDir, "timeline.json"), JSON.stringify(timeline, null, 2));
+  const jobId = uuid();
+  const jobDir = path.join(JOBS_DIR, jobId);
+  const assetsDir = path.join(jobDir, "assets");
 
+  fs.mkdirSync(assetsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(jobDir, "timeline.json"),
+    JSON.stringify(timeline, null, 2)
+  );
+
+  jobs.set(jobId, { status: "queued" });
+
+  /* ---- Immediate response (async render) ---- */
+  res.json({
+    jobId,
+    status: "queued",
+    statusUrl: `/status/${jobId}`,
+    downloadUrl: `/download/${jobId}`,
+  });
+
+  /* -------------------------------------------------
+     Background render (Render-safe)
+  -------------------------------------------------- */
+  (async () => {
     jobs.set(jobId, { status: "rendering" });
 
-    // Respond immediately (async job)
-    res.json({
-      jobId,
-      status: "rendering",
-      statusUrl: `/status/${jobId}`,
-      downloadUrl: `/download/${jobId}`,
-    });
+    try {
+      const inputs = [];
 
-    /* -------------------------------
-       BACKGROUND RENDER
-    -------------------------------- */
-    (async () => {
-      try {
-        const inputs = [];
+      for (let i = 0; i < timeline.media.length; i++) {
+        const media = timeline.media[i];
 
-        for (let i = 0; i < timeline.media.length; i++) {
-          const media = timeline.media[i];
-          const ext = media.type === "audio" ? "aac" : "mp4";
-          const localPath = path.join(assetsDir, `${i}.${ext}`);
-
-          console.log(`⬇️ Downloading ${media.url}`);
-          await downloadFile(media.url, localPath);
-
-          inputs.push({ ...media, path: localPath });
+        if (!media?.url || !media?.type) {
+          throw new Error(`Invalid media entry at index ${i}`);
         }
 
-        if (inputs.length === 0) throw new Error("No media to render");
+        const ext = media.type === "audio" ? "aac" : "mp4";
+        const localPath = path.join(assetsDir, `${i}.${ext}`);
 
-        const output = path.join(jobDir, "output.mp4");
+        console.log(`⬇️ [${jobId}] Downloading asset ${i}`);
+        await downloadFile(media.url, localPath);
 
-        const ffmpegArgs = [
-          "-y",
-          "-i", inputs[0].path,
-          "-c:v", "libx264",
-          "-preset", "medium",
-          "-crf", "18",
-          "-pix_fmt", "yuv420p",
-          "-movflags", "+faststart",
-          "-c:a", "aac",
-          "-b:a", "192k",
-          output,
-        ];
-
-        await runFFmpeg(ffmpegArgs, jobId);
-
-        const stats = fs.statSync(output);
-        if (stats.size < 100_000) throw new Error("Output video too small");
-
-        jobs.set(jobId, { status: "completed" });
-        console.log(`✅ Render complete: ${jobId}`);
-      } catch (err) {
-        console.error(`❌ Render failed ${jobId}:`, err.message);
-        jobs.set(jobId, { status: "failed" });
+        inputs.push({ ...media, path: localPath });
       }
-    })();
-  } catch (err) {
-    console.error("Render request error:", err);
-    res.status(500).json({ error: "Render failed" });
-  }
+
+      if (!inputs.length) {
+        throw new Error("Timeline contains no media");
+      }
+
+      const outputPath = path.join(jobDir, "output.mp4");
+
+      /* ---- Minimal, reliable FFmpeg pipeline ---- */
+      const ffmpegArgs = [
+        "-y",
+        "-i",
+        inputs[0].path,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        outputPath,
+      ];
+
+      await runFFmpeg(ffmpegArgs, jobId);
+
+      const stats = fs.statSync(outputPath);
+      if (stats.size < 150_000) {
+        throw new Error("Rendered video is suspiciously small");
+      }
+
+      jobs.set(jobId, { status: "completed" });
+      console.log(`✅ Render completed: ${jobId}`);
+    } catch (err) {
+      console.error(`❌ Render failed [${jobId}]:`, err.message);
+      jobs.set(jobId, { status: "failed", error: err.message });
+    }
+  })();
 });
 
 /* -------------------------------------------------
@@ -167,7 +208,9 @@ app.post("/render", async (req, res) => {
 -------------------------------------------------- */
 app.get("/status/:jobId", (req, res) => {
   const job = jobs.get(req.params.jobId);
-  if (!job) return res.status(404).json({ error: "Job not found" });
+  if (!job) {
+    return res.status(404).json({ error: "Job not found" });
+  }
   res.json(job);
 });
 
@@ -176,8 +219,12 @@ app.get("/status/:jobId", (req, res) => {
 -------------------------------------------------- */
 app.get("/download/:jobId", (req, res) => {
   const file = path.join(JOBS_DIR, req.params.jobId, "output.mp4");
-  if (!fs.existsSync(file)) return res.status(404).json({ error: "Not ready" });
-  res.download(file);
+
+  if (!fs.existsSync(file)) {
+    return res.status(404).json({ error: "Output not ready" });
+  }
+
+  res.download(file, "rendered-video.mp4");
 });
 
 /* -------------------------------------------------
