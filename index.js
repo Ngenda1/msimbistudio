@@ -3,7 +3,6 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import { exec } from "child_process";
-import fetch from "node-fetch";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
 
